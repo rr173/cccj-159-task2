@@ -341,6 +341,179 @@ class TestSignoffAndRelease(unittest.TestCase):
         self.assertEqual(rel["new_baseline_id"], "B-R2")
 
 
+class TestDelegation(unittest.TestCase):
+    ACTIVE_W = ("2020-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+    FUTURE_W = ("2999-01-01T00:00:00+00:00", "2999-02-01T00:00:00+00:00")
+    PAST_W = ("2020-01-01T00:00:00+00:00", "2020-02-01T00:00:00+00:00")
+
+    def _green_eco(self, svc, mods=("alu",)):
+        eid = make_eco(svc, mods=mods)
+        svc.freeze_eco(eid, "o")
+        run_all_pending(svc, eid)
+        return eid
+
+    def _config(self, svc, role=ROLE_TIMING, delegator="timing.zhang",
+                delegate="backup.wu", window=None):
+        w = window or self.ACTIVE_W
+        return svc.configure_delegation(role, delegator, delegate, w[0], w[1], "admin")
+
+    def test_configure_and_current_signers(self):
+        svc = fresh()
+        d = self._config(svc)
+        self.assertEqual(d["status"], "ACTIVE")
+        self.assertFalse(d.get("deduplicated"))
+        wb = svc.workbench()
+        self.assertEqual(len(wb["delegations"]), 1)
+        cs = wb["current_signers"][ROLE_TIMING]["delegates"]
+        self.assertEqual([(x["delegate"], x["delegator"]) for x in cs],
+                         [("backup.wu", "timing.zhang")])
+        self.assertIn("effective_to", cs[0])
+        actions = [a["action"] for a in svc.s.q_all("SELECT action FROM audit_log")]
+        self.assertIn("delegation.create", actions)
+
+    def test_duplicate_config_deduplicated(self):
+        svc = fresh()
+        d1 = self._config(svc)
+        d2 = self._config(svc)
+        self.assertEqual(d1["id"], d2["id"])
+        self.assertTrue(d2["deduplicated"])
+        self.assertEqual(len(svc.list_delegations()), 1)
+
+    def test_recreate_after_revoke_allowed(self):
+        svc = fresh()
+        d1 = self._config(svc)
+        svc.revoke_delegation(d1["id"], "admin")
+        d2 = self._config(svc)
+        self.assertNotEqual(d1["id"], d2["id"])
+        self.assertEqual(d2["status"], "ACTIVE")
+        statuses = {d["id"]: d["status"] for d in svc.list_delegations()}
+        self.assertEqual(statuses[d1["id"]], "REVOKED")
+        self.assertEqual(statuses[d2["id"]], "ACTIVE")
+
+    def test_double_revoke_rejected(self):
+        svc = fresh()
+        d = self._config(svc)
+        svc.revoke_delegation(d["id"], "admin")
+        with self.assertRaises(ECOError) as cm:
+            svc.revoke_delegation(d["id"], "admin")
+        self.assertEqual(cm.exception.code, "DELEGATION_ALREADY_REVOKED")
+
+    def test_bad_config_rejected(self):
+        svc = fresh()
+        with self.assertRaises(ECOError) as cm:
+            svc.configure_delegation("QA_LEAD", "a", "b", *self.ACTIVE_W, "admin")
+        self.assertEqual(cm.exception.code, "BAD_ROLE")
+        with self.assertRaises(ECOError) as cm:
+            svc.configure_delegation(ROLE_TIMING, "same", "same", *self.ACTIVE_W, "admin")
+        self.assertEqual(cm.exception.code, "BAD_DELEGATION")
+        with self.assertRaises(ECOError) as cm:
+            svc.configure_delegation(ROLE_TIMING, "a", "b",
+                                     self.ACTIVE_W[1], self.ACTIVE_W[0], "admin")
+        self.assertEqual(cm.exception.code, "BAD_TIME_WINDOW")
+        with self.assertRaises(ECOError) as cm:
+            svc.configure_delegation(ROLE_TIMING, "a", "b", "not-a-time",
+                                     self.ACTIVE_W[1], "admin")
+        self.assertEqual(cm.exception.code, "BAD_TIME")
+
+    def test_delegated_signoff_records_chain(self):
+        svc = fresh()
+        eid = self._green_eco(svc)
+        d = self._config(svc)
+        svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        sigs = svc.eco_detail(eid)["gate"]["valid_signoffs"]
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0]["user"], "backup.wu")
+        self.assertEqual(sigs[0]["delegator"], "timing.zhang")
+        self.assertEqual(sigs[0]["delegation_id"], d["id"])
+
+    def test_not_yet_effective_rejected(self):
+        svc = fresh()
+        eid = self._green_eco(svc)
+        self._config(svc, window=self.FUTURE_W)
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        self.assertEqual(cm.exception.code, "DELEGATION_NOT_YET_EFFECTIVE")
+
+    def test_expired_rejected(self):
+        svc = fresh()
+        eid = self._green_eco(svc)
+        self._config(svc, window=self.PAST_W)
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        self.assertEqual(cm.exception.code, "DELEGATION_EXPIRED")
+
+    def test_revoked_rejected(self):
+        svc = fresh()
+        eid = self._green_eco(svc)
+        d = self._config(svc)
+        svc.revoke_delegation(d["id"], "admin")
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        self.assertEqual(cm.exception.code, "DELEGATION_REVOKED")
+
+    def test_unknown_delegation_rejected(self):
+        svc = fresh()
+        eid = self._green_eco(svc)
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_TIMING, "ghost", on_behalf_of="timing.zhang")
+        self.assertEqual(cm.exception.code, "DELEGATION_NOT_FOUND")
+
+    def test_delegate_cannot_double_sign(self):
+        """同一自然人即使持有代理，也不得完成双角色签核。"""
+        svc = fresh()
+        eid = self._green_eco(svc)
+        self._config(svc)
+        svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        # 直接签另一角色
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_METHOD, "backup.wu")
+        self.assertEqual(cm.exception.code, "DUAL_ROLE_CONFLICT")
+        # 代理另一角色同样禁止
+        self._config(svc, role=ROLE_METHOD, delegator="method.li")
+        with self.assertRaises(ECOError) as cm:
+            svc.signoff(eid, ROLE_METHOD, "backup.wu", on_behalf_of="method.li")
+        self.assertEqual(cm.exception.code, "DUAL_ROLE_CONFLICT")
+
+    def test_refreeze_voids_delegated_signoff_but_keeps_audit(self):
+        svc = fresh()
+        eid = self._green_eco(svc, mods=("l2c",))
+        self._config(svc)
+        svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        svc.update_base_constraints({"clk_period_ns": 1.05}, "sdc")
+        g = svc.eco_detail(eid)["gate"]
+        self.assertEqual(g["valid_signoffs"], [])
+        # 已完成的签核保留当时身份与代理链（软作废，不删除）
+        voided = [s for s in g["signoffs"] if s["voided_at"]]
+        self.assertEqual(len(voided), 1)
+        self.assertEqual(voided[0]["user"], "backup.wu")
+        self.assertEqual(voided[0]["delegator"], "timing.zhang")
+        self.assertEqual(voided[0]["void_reason"], "constraint-bump")
+        acts = [dict(a) for a in svc.s.q_all(
+            "SELECT * FROM audit_log WHERE action='eco.signoff.void'")]
+        self.assertTrue(acts)
+        # rebase 后可用同一代理重签
+        svc.freeze_eco(eid, "o")
+        run_all_pending(svc, eid)
+        svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        self.assertEqual(len(svc.eco_detail(eid)["gate"]["valid_signoffs"]), 1)
+
+    def test_completed_signoff_survives_later_revoke(self):
+        """签核按动作发生时授权校验；事后撤销代理不影响已完成的签核。"""
+        svc = fresh()
+        eid = self._green_eco(svc)
+        d = self._config(svc)
+        svc.signoff(eid, ROLE_TIMING, "backup.wu", on_behalf_of="timing.zhang")
+        svc.revoke_delegation(d["id"], "admin")
+        svc.signoff(eid, ROLE_METHOD, "method.li")
+        rel = svc.release_start(eid, "o")
+        self.assertEqual(rel["new_baseline_id"], "B-R1")
+        pkg = svc.diff_package("B-R0", "B-R1")
+        sig = next(s for s in pkg["verification"]["signoffs"] if s["role"] == ROLE_TIMING)
+        self.assertEqual(sig["user"], "backup.wu")
+        self.assertEqual(sig["delegator"], "timing.zhang")
+        self.assertEqual(sig["delegation_id"], d["id"])
+
+
 class TestDiffPackage(unittest.TestCase):
     def test_diff_contents(self):
         svc = fresh()

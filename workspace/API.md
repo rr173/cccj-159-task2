@@ -17,6 +17,12 @@
   - `DEPENDENCY_BLOCKED` 依赖前置尚未全部 PASS
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
+- **代理签核错误**（HTTP 403/409）：
+  - `DELEGATION_NOT_FOUND` 不存在对应的代理授权记录
+  - `DELEGATION_NOT_YET_EFFECTIVE` 代理未到生效时间
+  - `DELEGATION_EXPIRED` 代理已过失效时间
+  - `DELEGATION_REVOKED` 代理已被管理员撤销
+  - `DELEGATION_ALREADY_REVOKED` 重复撤销同一代理（409）
 
 ## 端点
 
@@ -54,9 +60,25 @@ Runner **必须**对 `inputs` 自行按作用域计算 SHA-256 摘要（紧凑�
 ### 签核与发布
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/ecos/{id}/signoff` | `{role: TIMING_LEAD|METHODOLOGY_LEAD, user}` 门禁红时 409；同一人双签 409 |
+| POST | `/api/ecos/{id}/signoff` | `{role: TIMING_LEAD\|METHODOLOGY_LEAD, user, on_behalf_of?}` 门禁红时 409；同一人双签 409；`on_behalf_of` 非空即代理签核，按动作发生时刻校验代理授权（403）|
 | POST | `/api/ecos/{id}/release` | `{by, failpoint?}` 门禁/双签不满足 409 且状态不变；`failpoint=AFTER_PHASE1` 注入崩溃 |
 | POST | `/api/ecos/{id}/release/resume` | 从中断点幂等恢复 |
+
+### 临时代理签核
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/delegations` | `{role, delegator, delegate, effective_from, effective_to, by}` 管理员配置代理 → 201；**幂等**：同一配置重复提交返回既有记录（200 + `deduplicated`），不生成重复有效记录；已撤销的同配置可重新创建 |
+| GET | `/api/delegations` | 全部代理记录（含实时状态 `ACTIVE/PENDING/EXPIRED/REVOKED`）与各角色当前可签人员 `current_signers` |
+| POST | `/api/delegations/{id}/revoke` | `{by}` 随时撤销，即刻生效；重复撤销 409 |
+
+代理签核规则：
+
+- 签核动作发生时刻必须存在**生效中**的代理授权：未生效 / 已过期 / 已撤销一律 403。
+- 签核记录的 `user` 恒为实际操作的自然人；代理签核额外落库 `delegator`（被代理人）
+  与 `delegation_id`，形成可审计代理链，并随差异包 `verification/signoffs.json` 输出。
+- 双角色仍必须是两个不同自然人：直接签与代理签均按实际操作人计。
+- 已完成的签核不因代理事后过期/撤销而失效；但 ECO 重新冻结（rebase/合并/新基线发布）
+  仍使其失效——记录软作废（`voided_at/void_reason`）保留用于审计，不再计入门禁。
 
 ### 冲突与基础约束
 | 方法 | 路径 | 说明 |

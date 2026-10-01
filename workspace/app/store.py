@@ -77,12 +77,35 @@ CREATE TABLE IF NOT EXISTS signoff (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     eco_id          TEXT NOT NULL,
     role            TEXT NOT NULL,
-    user            TEXT NOT NULL,
+    user            TEXT NOT NULL,            -- 实际操作人（自然人）
+    delegator       TEXT,                     -- 被代理人（角色负责人）；NULL=直接签核
+    delegation_id   INTEGER,                  -- 签核时使用的代理记录；NULL=直接签核
     epoch           INTEGER NOT NULL,
     overall_fp      TEXT NOT NULL,
     at              TEXT NOT NULL,
+    voided_at       TEXT,                     -- 纪元变化使签核失效的时刻（记录保留用于审计）
+    void_reason     TEXT,
     UNIQUE(eco_id, role, epoch)
 );
+
+-- 临时代理签核：管理员为签核角色配置 [生效,失效] 窗口内的代理人，可随时撤销。
+-- 部分唯一索引：同一配置（角色/被代理人/代理人/窗口）最多一条未撤销记录，
+-- 重复提交同一配置幂等返回既有记录，不产生重复有效记录。
+CREATE TABLE IF NOT EXISTS delegation (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    role            TEXT NOT NULL,            -- TIMING_LEAD / METHODOLOGY_LEAD
+    delegator       TEXT NOT NULL,            -- 被代理人（角色负责人）
+    delegate        TEXT NOT NULL,            -- 代理人（自然人）
+    effective_from  TEXT NOT NULL,            -- 生效时间（UTC ISO-8601）
+    effective_to    TEXT NOT NULL,            -- 失效时间（UTC ISO-8601）
+    created_by      TEXT NOT NULL,            -- 配置的管理员
+    created_at      TEXT NOT NULL,
+    revoked_at      TEXT,
+    revoked_by      TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_active
+    ON delegation(role, delegator, delegate, effective_from, effective_to)
+    WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS module_lock (
     module          TEXT PRIMARY KEY,
@@ -220,8 +243,21 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.lock = threading.RLock()
         self.conn.executescript(SCHEMA)
+        self._migrate()
         if seed:
             self._seed()
+
+    def _migrate(self):
+        """老库就地升级：signoff 增补代理链与作废标记列（新库由 SCHEMA 建全）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(signoff)")}
+        for col, ddl in [
+            ("delegator", "ALTER TABLE signoff ADD COLUMN delegator TEXT"),
+            ("delegation_id", "ALTER TABLE signoff ADD COLUMN delegation_id INTEGER"),
+            ("voided_at", "ALTER TABLE signoff ADD COLUMN voided_at TEXT"),
+            ("void_reason", "ALTER TABLE signoff ADD COLUMN void_reason TEXT"),
+        ]:
+            if col not in cols:
+                self.conn.execute(ddl)
 
     # ---- 事务辅助 ----
     class _Tx:
@@ -277,6 +313,7 @@ class Store:
         with self.tx() as c:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff",
-                      "check_run", "eco", "constraint_event", "trunk", "baseline"]:
+                      "delegation", "check_run", "eco", "constraint_event",
+                      "trunk", "baseline"]:
                 c.execute(f"DELETE FROM {t}")
         self._seed()

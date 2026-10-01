@@ -139,6 +139,68 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(m["freeze_epoch"], 2)
         self.assertIn("B_FIX", m["edits"]["noc"]["netlist"])
 
+    def test_delegation_flow_via_http(self):
+        # 配置代理：201；同一配置重复提交幂等返回既有记录（200，同 id）
+        body = {"role": "TIMING_LEAD", "delegator": "timing.zhang",
+                "delegate": "backup.wu", "effective_from": "2020-01-01T00:00:00Z",
+                "effective_to": "2099-01-01T00:00:00Z", "by": "admin"}
+        s, d1 = self.call("/api/delegations", "POST", body)
+        self.assertEqual(s, 201)
+        self.assertEqual(d1["status"], "ACTIVE")
+        s, d2 = self.call("/api/delegations", "POST", body)
+        self.assertEqual(s, 200)
+        self.assertEqual(d1["id"], d2["id"])
+        self.assertTrue(d2["deduplicated"])
+        s, lst = self.call("/api/delegations")
+        self.assertEqual(s, 200)
+        self.assertEqual(len([d for d in lst["delegations"] if d["id"] == d1["id"]]), 1)
+        self.assertTrue(any(x["delegate"] == "backup.wu"
+                            for x in lst["current_signers"]["TIMING_LEAD"]["delegates"]))
+
+        # 建单跑绿后用代理签核：记录代理链
+        s, d = self.call("/api/ecos", "POST", {
+            "title": "代理签核流", "owner": "o", "affected_modules": ["core"],
+            "edits": {"core": {"netlist": "MODULE core; CELL DG_FIX; ENDMODULE"}}})
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "o"})
+        for _ in range(20):
+            s, d = self.call(f"/api/ecos/{eid}")
+            pending = [c["type"] for c in d["gate"]["checks"] if c["status"] == "PENDING"]
+            if not pending:
+                break
+            for t in pending:
+                s, pkt = self.call(f"/api/ecos/{eid}/checks/{t}/inputs")
+                fp = compute_input_fingerprint(t, pkt["inputs"])
+                self.call(f"/api/ecos/{eid}/checks/{t}/results", "POST",
+                          {"run_id": pkt["run_id"], "fingerprint": fp, "verdict": "PASS"})
+        s, d = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                         {"role": "TIMING_LEAD", "user": "backup.wu",
+                          "on_behalf_of": "timing.zhang"})
+        self.assertEqual(s, 200)
+        sig = d["gate"]["valid_signoffs"][0]
+        self.assertEqual(sig["user"], "backup.wu")
+        self.assertEqual(sig["delegator"], "timing.zhang")
+        self.assertEqual(sig["delegation_id"], d1["id"])
+
+        # 撤销后同一代理签核按动作发生时校验被拒；重复撤销 409
+        s, rv = self.call(f"/api/delegations/{d1['id']}/revoke", "POST", {"by": "admin"})
+        self.assertEqual(s, 200)
+        self.assertEqual(rv["status"], "REVOKED")
+        s, err = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                           {"role": "TIMING_LEAD", "user": "backup.wu",
+                            "on_behalf_of": "timing.zhang"})
+        self.assertEqual(s, 403)
+        self.assertEqual(err["error"], "DELEGATION_REVOKED")
+        s, err = self.call(f"/api/delegations/{d1['id']}/revoke", "POST", {"by": "admin"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "DELEGATION_ALREADY_REVOKED")
+        # 从未配置过的代理 → 403
+        s, err = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                           {"role": "METHODOLOGY_LEAD", "user": "ghost",
+                            "on_behalf_of": "method.li"})
+        self.assertEqual(s, 403)
+        self.assertEqual(err["error"], "DELEGATION_NOT_FOUND")
+
     def test_static_index(self):
         s, data, _ = self.call("/", raw=True)
         self.assertEqual(s, 200)

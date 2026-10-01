@@ -14,6 +14,7 @@ import copy
 import hashlib
 import io
 import json
+import sqlite3
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -43,6 +44,22 @@ def canon(obj) -> bytes:
 
 def fp_json(obj) -> str:
     return hashlib.sha256(canon(obj)).hexdigest()[:16]
+
+
+def parse_ts(s, field="time") -> datetime:
+    """解析 ISO-8601 时间（naive 视为 UTC），返回 aware datetime。"""
+    if not isinstance(s, str) or not s.strip():
+        raise ECOError("BAD_TIME", f"{field} 缺失或不是字符串", 400)
+    try:
+        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ECOError("BAD_TIME", f"{field} 时间格式非法: {s!r}（需 ISO-8601）", 400)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def canon_ts(dt: datetime) -> str:
+    """统一规范化为 UTC 秒精度字符串，保证词法序 == 时序。"""
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 def matrix_catalog():
@@ -250,8 +267,22 @@ class ECOService:
             c.execute("UPDATE check_run SET status='SUPERSEDED' WHERE id=?", (r["id"],))
         return len(rows)
 
-    def _void_signoffs(self, c, eco_id):
-        c.execute("DELETE FROM signoff WHERE eco_id=?", (eco_id,))
+    def _void_signoffs(self, c, eco_id, reason=""):
+        """纪元变化使既有签核失效：不删除记录，仅标记作废——已完成的签核保留
+        当时身份与代理链用于审计，但不再计入门禁。"""
+        rows = c.execute(
+            "SELECT * FROM signoff WHERE eco_id=? AND voided_at IS NULL",
+            (eco_id,)).fetchall()
+        if not rows:
+            return 0
+        c.execute("UPDATE signoff SET voided_at=?, void_reason=? "
+                  "WHERE eco_id=? AND voided_at IS NULL", (utcnow(), reason, eco_id))
+        self._audit(c, "eco.signoff.void", eco_id, "system", {
+            "reason": reason,
+            "voided": [{"role": r["role"], "user": r["user"],
+                        "delegator": r["delegator"], "delegation_id": r["delegation_id"],
+                        "epoch": r["epoch"]} for r in rows]})
+        return len(rows)
 
     def _lock_conflicts(self, c, modules, exclude_eco=None):
         q = ("SELECT module, eco_id FROM module_lock WHERE module IN (%s)"
@@ -305,7 +336,7 @@ class ECOService:
                  trunk["constraints_version"], json.dumps(snap, ensure_ascii=False), fp,
                  epoch, eco_id))
             self._supersede_runs(c, eco_id, "refreeze")
-            self._void_signoffs(c, eco_id)
+            self._void_signoffs(c, eco_id, "refreeze")
             for m in modules:
                 # 重冻结（rebase/合并后）时锁可能仍属于本 ECO
                 c.execute("INSERT OR IGNORE INTO module_lock(module,eco_id,acquired_at)"
@@ -459,6 +490,129 @@ class ECOService:
             self._audit(c, "check.rerun", f"{eco_id}:{check_type}", by, {"attempt": attempt})
             return self.eco_detail(eco_id, c)
 
+    # ===== 临时代理签核 =====
+    @staticmethod
+    def _delegation_status(d, now: str) -> str:
+        if d["revoked_at"]:
+            return "REVOKED"
+        if now < d["effective_from"]:
+            return "PENDING"
+        if now > d["effective_to"]:
+            return "EXPIRED"
+        return "ACTIVE"
+
+    def _delegation_dict(self, row, now: str | None = None):
+        d = dict(row)
+        d["status"] = self._delegation_status(d, now or utcnow())
+        return d
+
+    def configure_delegation(self, role, delegator, delegate,
+                             effective_from, effective_to, by):
+        """管理员配置临时代理：代理人在 [生效,失效] 窗口内可代被代理人行使签核角色。
+
+        幂等：同一配置（角色/被代理人/代理人/窗口）已存在未撤销记录时直接返回，
+        不生成重复有效记录；已撤销的同配置允许重新创建。
+        """
+        if role not in SIGNOFF_ROLES:
+            raise ECOError("BAD_ROLE", f"角色须为 {SIGNOFF_ROLES}", 400)
+        if not delegator or not delegate:
+            raise ECOError("BAD_REQUEST", "delegator/delegate 必填", 400)
+        if delegator == delegate:
+            raise ECOError("BAD_DELEGATION", "代理人与被代理人不能是同一自然人", 400)
+        frm = canon_ts(parse_ts(effective_from, "effective_from"))
+        to = canon_ts(parse_ts(effective_to, "effective_to"))
+        if frm >= to:
+            raise ECOError("BAD_TIME_WINDOW", "生效时间必须早于失效时间", 400)
+        with self.s.tx() as c:
+            dup = c.execute(
+                "SELECT * FROM delegation WHERE role=? AND delegator=? AND delegate=?"
+                " AND effective_from=? AND effective_to=? AND revoked_at IS NULL",
+                (role, delegator, delegate, frm, to)).fetchone()
+            if dup:
+                out = self._delegation_dict(dup)
+                out["deduplicated"] = True
+                return out
+            try:
+                cur = c.execute(
+                    "INSERT INTO delegation(role,delegator,delegate,effective_from,"
+                    "effective_to,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (role, delegator, delegate, frm, to, by, utcnow()))
+            except sqlite3.IntegrityError:
+                # 并发重复提交撞上部分唯一索引：按幂等返回既有记录
+                dup = c.execute(
+                    "SELECT * FROM delegation WHERE role=? AND delegator=? AND delegate=?"
+                    " AND effective_from=? AND effective_to=? AND revoked_at IS NULL",
+                    (role, delegator, delegate, frm, to)).fetchone()
+                out = self._delegation_dict(dup)
+                out["deduplicated"] = True
+                return out
+            did = cur.lastrowid
+            self._audit(c, "delegation.create", f"delegation:{did}", by,
+                        {"id": did, "role": role, "delegator": delegator,
+                         "delegate": delegate, "effective_from": frm, "effective_to": to})
+            return self._delegation_dict(c.execute(
+                "SELECT * FROM delegation WHERE id=?", (did,)).fetchone())
+
+    def revoke_delegation(self, delegation_id, by):
+        """随时撤销代理：撤销即刻生效，此后的代理签核一律拒绝（已完成的签核保留）。"""
+        with self.s.tx() as c:
+            d = c.execute("SELECT * FROM delegation WHERE id=?",
+                          (delegation_id,)).fetchone()
+            if not d:
+                raise ECOError("DELEGATION_NOT_FOUND",
+                               f"代理记录 {delegation_id} 不存在", 404)
+            if d["revoked_at"]:
+                raise ECOError("DELEGATION_ALREADY_REVOKED", "该代理已撤销", 409)
+            c.execute("UPDATE delegation SET revoked_at=?, revoked_by=? WHERE id=?",
+                      (utcnow(), by, delegation_id))
+            self._audit(c, "delegation.revoke", f"delegation:{delegation_id}", by,
+                        {"role": d["role"], "delegator": d["delegator"],
+                         "delegate": d["delegate"]})
+            return self._delegation_dict(c.execute(
+                "SELECT * FROM delegation WHERE id=?", (delegation_id,)).fetchone())
+
+    def list_delegations(self):
+        with self.s.lock:
+            now = utcnow()
+            return [self._delegation_dict(r, now) for r in self.s.q_all(
+                "SELECT * FROM delegation ORDER BY id DESC")]
+
+    def current_signers(self):
+        """各签核角色当前时刻可签人员：角色负责人本人 + 生效中的临时代理（含来源与有效期）。"""
+        out = {r: {"role": r, "delegates": []} for r in SIGNOFF_ROLES}
+        for d in self.list_delegations():
+            if d["status"] == "ACTIVE":
+                out[d["role"]]["delegates"].append({
+                    "delegation_id": d["id"], "delegate": d["delegate"],
+                    "delegator": d["delegator"],
+                    "effective_from": d["effective_from"],
+                    "effective_to": d["effective_to"]})
+        return out
+
+    def _check_delegation(self, c, role, delegator, delegate):
+        """按签核动作发生时刻校验代理授权：未生效/已过期/已撤销一律拒绝。"""
+        d = c.execute(
+            "SELECT * FROM delegation WHERE role=? AND delegator=? AND delegate=?"
+            " ORDER BY id DESC LIMIT 1", (role, delegator, delegate)).fetchone()
+        if not d:
+            raise ECOError("DELEGATION_NOT_FOUND",
+                           f"不存在 {delegator} 授权 {delegate} 行使 {role} 的代理记录", 403)
+        now = utcnow()
+        if d["revoked_at"]:
+            raise ECOError("DELEGATION_REVOKED",
+                           f"代理已于 {d['revoked_at']} 被 {d['revoked_by']} 撤销", 403,
+                           {"delegation_id": d["id"], "revoked_at": d["revoked_at"]})
+        if now < d["effective_from"]:
+            raise ECOError("DELEGATION_NOT_YET_EFFECTIVE",
+                           f"代理 {d['effective_from']} 才生效，当前时刻无权签核", 403,
+                           {"delegation_id": d["id"],
+                            "effective_from": d["effective_from"]})
+        if now > d["effective_to"]:
+            raise ECOError("DELEGATION_EXPIRED",
+                           f"代理已于 {d['effective_to']} 失效", 403,
+                           {"delegation_id": d["id"], "effective_to": d["effective_to"]})
+        return d
+
     # ===== 门禁与签核 =====
     def gate(self, eco_row, c):
         eco_id = eco_row["id"]
@@ -488,7 +642,8 @@ class ECOService:
         signoffs = [dict(r) for r in c.execute(
             "SELECT * FROM signoff WHERE eco_id=? ORDER BY role", (eco_id,)).fetchall()]
         epoch = eco_row["freeze_epoch"]
-        valid_sigs = [s for s in signoffs if s["epoch"] == epoch
+        valid_sigs = [s for s in signoffs if s["voided_at"] is None
+                      and s["epoch"] == epoch
                       and s["overall_fp"] == eco_row["fingerprint"]]
         roles = {s["role"]: s["user"] for s in valid_sigs}
         dual = all(r in roles for r in SIGNOFF_ROLES) and len(set(roles.values())) == 2
@@ -502,21 +657,30 @@ class ECOService:
             "releasable": required_pass and dual,
         }
 
-    def signoff(self, eco_id, role, user):
+    def signoff(self, eco_id, role, user, on_behalf_of=None):
+        """签核。on_behalf_of 非空时为代理签核：user 是实际操作人（自然人），
+        必须存在动作发生时刻生效的代理授权；签核记录保留当时身份与代理链。"""
         if role not in SIGNOFF_ROLES:
             raise ECOError("BAD_ROLE", f"角色须为 {SIGNOFF_ROLES}", 400)
         if not user:
             raise ECOError("BAD_REQUEST", "user 必填", 400)
+        if on_behalf_of and on_behalf_of == user:
+            raise ECOError("BAD_DELEGATION", "代理人与被代理人不能是同一自然人", 400)
         with self.s.tx() as c:
             eco = self._get_eco(eco_id)
             if eco["status"] != "FROZEN":
                 raise ECOError("NOT_FROZEN", f"状态 {eco['status']} 不可签核", 409)
+            delegator, delegation_id = None, None
+            if on_behalf_of:
+                d = self._check_delegation(c, role, on_behalf_of, user)
+                delegator, delegation_id = on_behalf_of, d["id"]
             g = self.gate(eco, c)
             if not g["green"]:
                 raise ECOError("GATE_RED", "必需检查未全部针对当前基线通过，禁止签核", 409,
                                {"checks": [{"type": x["type"], "status": x["status"]}
                                            for x in g["checks"] if x["required"]
                                            and not x["satisfied"]]})
+            # 双角色必须是两个不同自然人：直接签与代理签均按实际操作人计
             other = next((s for s in g["valid_signoffs"]
                           if s["role"] != role and s["user"] == user), None)
             if other:
@@ -525,9 +689,13 @@ class ECOService:
             c.execute("DELETE FROM signoff WHERE eco_id=? AND role=? AND epoch=?",
                       (eco_id, role, eco["freeze_epoch"]))
             c.execute(
-                "INSERT INTO signoff(eco_id,role,user,epoch,overall_fp,at) VALUES(?,?,?,?,?,?)",
-                (eco_id, role, user, eco["freeze_epoch"], eco["fingerprint"], utcnow()))
-            self._audit(c, "eco.signoff", eco_id, user, {"role": role})
+                "INSERT INTO signoff(eco_id,role,user,delegator,delegation_id,epoch,"
+                "overall_fp,at) VALUES(?,?,?,?,?,?,?,?)",
+                (eco_id, role, user, delegator, delegation_id,
+                 eco["freeze_epoch"], eco["fingerprint"], utcnow()))
+            self._audit(c, "eco.signoff", eco_id, user,
+                        {"role": role, "delegator": delegator,
+                         "delegation_id": delegation_id})
             return self.eco_detail(eco_id, c)
 
     # ===== 基础约束刷新 =====
@@ -562,7 +730,7 @@ class ECOService:
                                      "constraints_version": version}, ensure_ascii=False),
                          utcnow()))
                     self._supersede_runs(c, eco["id"], "constraint-bump")
-                    self._void_signoffs(c, eco["id"])
+                    self._void_signoffs(c, eco["id"], "constraint-bump")
                     affected_ecos.append(eco["id"])
             self._audit(c, "constraint.update", trunk["base_id"], by,
                         {"delta": delta, "version": version, "rebased_ecos": affected_ecos})
@@ -648,7 +816,7 @@ class ECOService:
                 (json.dumps(merged_modules), json.dumps(merged_edits, ensure_ascii=False),
                  json.dumps(snap, ensure_ascii=False), fp, epoch, target_eco_id))
             self._supersede_runs(c, target_eco_id, "merge")
-            self._void_signoffs(c, target_eco_id)
+            self._void_signoffs(c, target_eco_id, "merge")
             for m in added:
                 c.execute("INSERT INTO module_lock(module,eco_id,acquired_at) VALUES(?,?,?)",
                           (m, target_eco_id, utcnow()))
@@ -753,7 +921,7 @@ class ECOService:
                      json.dumps({"published_baseline": new_id, "by_eco": eco_id},
                                 ensure_ascii=False), utcnow()))
                 self._supersede_runs(c, sid, "new-baseline-published")
-                self._void_signoffs(c, sid)
+                self._void_signoffs(c, sid, "new-baseline-published")
                 self._audit(c, "eco.rebase_required", sid, "system",
                             {"reason": "newer baseline published", "baseline": new_id})
             c.execute(
@@ -817,6 +985,8 @@ class ECOService:
                 "recent_audit": [dict(r) for r in self.s.q_all(
                     "SELECT seq,actor,action,entity,at FROM audit_log ORDER BY seq DESC LIMIT 30")],
                 "constraints": self.current_constraints(),
+                "delegations": self.list_delegations(),
+                "current_signers": self.current_signers(),
             }
 
     def current_constraints(self):
@@ -871,7 +1041,8 @@ class ECOService:
                 if er:
                     eco = {"id": er["id"], "title": er["title"], "owner": er["owner"]}
                     signoffs = [dict(r) for r in self.s.q_all(
-                        "SELECT role,user,epoch,overall_fp,at FROM signoff WHERE eco_id=?",
+                        "SELECT role,user,delegator,delegation_id,epoch,overall_fp,at "
+                        "FROM signoff WHERE eco_id=? AND voided_at IS NULL",
                         (b_new["eco_id"],))]
                     check_results = [dict(r) for r in self.s.q_all(
                         "SELECT check_type,attempt,status,required,result_fp,expected_fp,"

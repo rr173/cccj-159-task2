@@ -30,7 +30,10 @@
 - **三重拒收**：`FINGERPRINT_MISMATCH`（输入被改/拿错基线）、`STALE_SUPERSEDED`
   （纪元已变，结果迟到）、`ALREADY_SUBMITTED`（重复提交）。所有拒收进 `rejected_result` 审计表。
 - **冻结纪元 freeze_epoch**：rebase / 合并扩张均令纪元 +1，旧 run 整批 `SUPERSEDED`，
-  旧签核因 `(epoch, overall_fp)` 不再匹配而失效。
+  旧签核因 `(epoch, overall_fp)` 不再匹配而失效（软作废保留审计）。
+- **临时代理签核**：管理员可为两种签核角色配置带生效/失效时间的代理并随时撤销；
+  签核按动作发生时刻校验代理授权，签核记录保留当时身份与代理链（`delegator` +
+  `delegation_id`）供审计；双角色仍禁止同一自然人完成。
 - **依赖图**：`LAYOUT_DRC` 依赖 `TIMING_STA`+`POWER_ANALYSIS`，前置未 PASS 时保持
   `BLOCKED`，提前提交以 `DEPENDENCY_BLOCKED` 拒收；前置 FAIL 不会解锁下游。
 
@@ -46,7 +49,7 @@ open http://localhost:8080
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（28 个：领域单测 + 真实 HTTP 端到端）
+# 全部测试（43 个：领域单测 + 真实 HTTP 端到端）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -60,11 +63,11 @@ app/
   api.py      stdlib HTTP REST 路由
   demo.py     四场景端到端演示
 web/
-  index.html  签核工作台（ECO 队列、门禁矩阵、签核、差异包、拒收留痕）
+  index.html  签核工作台（ECO 队列、门禁矩阵、签核、代理配置、差异包、拒收留痕）
   app.js      零依赖 JS；浏览器端用 WebCrypto 复算 Runner 指纹
 tests/
-  test_service.py  23 个领域不变量测试
-  test_api.py       5 个真实 socket HTTP 测试
+  test_service.py  37 个领域不变量测试
+  test_api.py       6 个真实 socket HTTP 测试
 ```
 
 ## ECO 状态机
@@ -86,6 +89,7 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
 详见 [API.md](API.md)。主要端点：
 
 - `POST /api/ecos` · `POST /api/ecos/{id}/freeze|abort|signoff|release|release/resume`
+- `POST /api/delegations` · `GET /api/delegations` · `POST /api/delegations/{id}/revoke`（临时代理签核）
 - `GET  /api/ecos/{id}/checks/{type}/inputs`（Runner 拉冻结输入）
 - `POST /api/ecos/{id}/checks/{type}/results|rerun`
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`

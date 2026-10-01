@@ -35,6 +35,8 @@
   .s-QUEUED{background:#5c4a1e;color:#ffe7b0} .s-REBASE_REQUIRED{background:#5c3b1e;color:#ffd8b0}
   .s-RELEASING{background:#4a2a66;color:#e7d1ff} .s-RELEASED{background:#155a38;color:#bdf3d5}
   .s-ABORTED{background:#4a202a;color:#f3c3cd} .s-MERGED{background:#2e5557;color:#c2efec}
+  .dg-ACTIVE{background:#155a38;color:#bdf3d5} .dg-PENDING{background:#5c4a1e;color:#ffe7b0}
+  .dg-EXPIRED{background:#37425c;color:#c6d0e6} .dg-REVOKED{background:#4a202a;color:#f3c3cd}
   .c-PASS{color:var(--ok)} .c-FAIL{color:var(--bad)} .c-PENDING{color:var(--warn)}
   .c-BLOCKED,.c-SUPERSEDED,.c-MISSING{color:var(--block)}
   .chip { font-size:11px; padding:1px 7px; border:1px solid var(--line); border-radius:20px;color:var(--mut);}
@@ -104,6 +106,26 @@
     <div class="row"><b>模块锁：</b><span id="locks" class="mono"></span></div>
     <div class="row mut">迟到、串基线、被作废的结果一律拒收，绝不拼接复用：</div>
     <div id="rejects"></div>
+  </div>
+
+  <div class="panel">
+    <h2>⑤ 临时代理签核（管理员配置）</h2>
+    <div class="row mut">为签核角色配置临时代理：代理人在有效期窗口内可代被代理人签核，
+      可随时撤销；签核按动作发生时刻校验授权并留存代理链。重复提交同一配置不会生成重复记录。</div>
+    <div class="grid2">
+      <select id="dg-role">
+        <option value="TIMING_LEAD">时序负责人 TIMING_LEAD</option>
+        <option value="METHODOLOGY_LEAD">方法学负责人 METHODOLOGY_LEAD</option>
+      </select>
+      <input id="dg-by" placeholder="管理员" value="admin"/>
+      <input id="dg-delegator" placeholder="被代理人（角色负责人）" value="timing.zhang"/>
+      <input id="dg-delegate" placeholder="代理人（自然人）" value="backup.wu"/>
+      <label class="mut">生效 <input id="dg-from" type="datetime-local"/></label>
+      <label class="mut">失效 <input id="dg-to" type="datetime-local"/></label>
+    </div>
+    <div class="row"><button onclick="createDelegation()">配置代理</button></div>
+    <div id="signers"></div>
+    <div id="delegations"></div>
   </div>
 </div>
 </div>

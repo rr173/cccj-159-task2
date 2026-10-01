@@ -110,6 +110,9 @@ def _make_handler(svc: ECOService):
                     return self._send(200, svc.current_constraints())
                 if path == "/api/rejected-results":
                     return self._send(200, {"rejected": svc.rejected_results()})
+                if path == "/api/delegations":
+                    return self._send(200, {"delegations": svc.list_delegations(),
+                                            "current_signers": svc.current_signers()})
                 self._send(404, {"error": "NOT_FOUND", "message": path})
             except ECOError as e:
                 self._err(e)
@@ -148,7 +151,18 @@ def _make_handler(svc: ECOService):
                 m = re.fullmatch(r"/api/ecos/([^/]+)/signoff", path)
                 if m:
                     return self._send(200, svc.signoff(
-                        m.group(1), b["role"], b.get("user", b.get("by", "?"))))
+                        m.group(1), b["role"], b.get("user", b.get("by", "?")),
+                        b.get("on_behalf_of")))
+                if path == "/api/delegations":
+                    d = svc.configure_delegation(
+                        b["role"], b["delegator"], b["delegate"],
+                        b["effective_from"], b["effective_to"], b.get("by", "?"))
+                    # 幂等：重复提交同一配置返回既有记录，不新建
+                    return self._send(200 if d.get("deduplicated") else 201, d)
+                m = re.fullmatch(r"/api/delegations/(\d+)/revoke", path)
+                if m:
+                    return self._send(200, svc.revoke_delegation(
+                        int(m.group(1)), b.get("by", "?")))
                 # 更具体的路径必须排在同前缀通用模式之前（fullmatch 已锚定，
                 # 但 merge-into 有两段，需先于通用段；resume 亦先于裸 release 防御）
                 m = re.fullmatch(r"/api/ecos/([^/]+)/release/resume", path)

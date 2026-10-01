@@ -7,6 +7,8 @@ const STATUS_CN = {
 };
 const CHECK_CN = {TIMING_STA: "时序STA", POWER_ANALYSIS: "功耗", FORMAL_EQUIV: "形式验证",
                   LAYOUT_DRC: "版图DRC", LINT_INFO: "Lint(非必需)"};
+const ROLE_CN = {TIMING_LEAD: "时序负责人", METHODOLOGY_LEAD: "方法学负责人"};
+const DG_STATUS = {ACTIVE: "生效中", PENDING: "未生效", EXPIRED: "已过期", REVOKED: "已撤销"};
 
 function toast(msg, kind="") {
   const t = document.createElement("div");
@@ -107,7 +109,7 @@ const act = async (p,b,msg) => { try { const d = await api(p,"POST",b||{}); toas
 async function refresh() {
   const w = await api("/api/workbench"); window.WB = w;
   $("trunk").textContent = `当前发布基线 ${w.constraints.base_id}(rev ${w.constraints.base_revision}) · 约束版本 v${w.constraints.constraints_version}`;
-  renderEcos(w); renderBaselines(w); renderMisc(w);
+  renderEcos(w); renderBaselines(w); renderMisc(w); renderDelegations(w);
 }
 
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
@@ -122,6 +124,30 @@ function checkTable(gate) {
       <td class="mut">${esc(c.runner_id||"")}</td></tr>`).join("") + "</table>";
 }
 
+// 每个签核角色一个身份选择：本人直接签，或以生效中的代理身份签（代理链随签核留痕）
+function signoffControls(e, w) {
+  const g = e.gate;
+  const defs = {TIMING_LEAD: "timing.zhang", METHODOLOGY_LEAD: "method.li"};
+  return Object.entries(defs).map(([role, defUser]) => {
+    const dels = (w.delegations||[]).filter(d => d.role===role && d.status==="ACTIVE");
+    const opts = [`<option value="">本人 ${defUser}</option>`].concat(
+      dels.map(d => `<option value="${d.id}">代理 ${esc(d.delegate)} 代 ${esc(d.delegator)}</option>`)).join("");
+    return `<span class="chip">${ROLE_CN[role]}</span><select id="so-${e.id}-${role}">${opts}</select>
+      <button ${g.green?"":"disabled"} onclick="doSignoff('${e.id}','${role}','${defUser}')">签核</button>`;
+  }).join(" ");
+}
+
+async function doSignoff(ecoId, role, defUser) {
+  const v = $(`so-${ecoId}-${role}`).value;
+  let body = {role, user: defUser};
+  if (v) {
+    const d = window.WB.delegations.find(x => String(x.id) === v);
+    body = {role, user: d.delegate, on_behalf_of: d.delegator};
+  }
+  await act(`/api/ecos/${ecoId}/signoff`, body,
+            body.on_behalf_of ? `代理签核完成：${body.user} 代 ${body.on_behalf_of}` : "签核完成");
+}
+
 function renderEcos(w) {
   $("ecos").innerHTML = w.ecos.map(e => {
     const g = e.gate;
@@ -134,10 +160,8 @@ function renderEcos(w) {
     if (e.status==="FROZEN" && g.checks.some(c=>c.status==="FAIL"))
       btns += `<button class="sec" onclick="act('/api/ecos/${e.id}/checks/TIMING_STA/rerun',{by:'${e.owner}'},'旧尝试已作废，已按当前基线重跑')">重跑时序</button>`;
     if (e.status==="FROZEN") {
-      btns += `<span style="margin-left:6px"></span>
-        <button ${g.green?"":"disabled"} onclick="act('/api/ecos/${e.id}/signoff',{role:'TIMING_LEAD',user:'timing.zhang'},'时序负责人已签核')">签核:时序负责人</button>
-        <button ${g.green?"":"disabled"} onclick="act('/api/ecos/${e.id}/signoff',{role:'METHODOLOGY_LEAD',user:'method.li'},'方法学负责人已签核')">签核:方法学负责人</button>
-        <button ${g.releasable?"":"disabled"} onclick="act('/api/ecos/${e.id}/release',{by:'${e.owner}'},'新基线已发布')">发布基线</button>
+      btns += `<span style="margin-left:6px"></span>` + signoffControls(e, w) +
+        `<button ${g.releasable?"":"disabled"} onclick="act('/api/ecos/${e.id}/release',{by:'${e.owner}'},'新基线已发布')">发布基线</button>
         <button class="danger" onclick="act('/api/ecos/${e.id}/release',{by:'${e.owner}',failpoint:'AFTER_PHASE1'}).then(()=>{}).catch(()=>{})">模拟发布中断</button>`;
     }
     if (e.status==="RELEASING")
@@ -153,7 +177,8 @@ function renderEcos(w) {
     if (e.status==="FROZEN")
       btns += `<button class="sec" onclick="lateResult('${e.id}')">模拟迟到结果</button>
         <button class="sec" onclick="tamperResult('${e.id}')">模拟串用他单指纹</button>`;
-    const sigs = g.valid_signoffs.map(s=>`<span class="chip">${s.role==='TIMING_LEAD'?'时序负责人':'方法学负责人'}: ${esc(s.user)} ✓</span>`).join(" ");
+    const sigs = g.valid_signoffs.map(s=>`<span class="chip">${ROLE_CN[s.role]||s.role}: ${esc(s.user)}${s.delegator?`（代 ${esc(s.delegator)}）`:""} ✓</span>`).join(" ");
+    const voided = (g.signoffs||[]).filter(s=>s.voided_at);
     return `<div class="card">
       <div class="row"><b class="mono">${e.id}</b> ${esc(e.title)}
         <span class="tag s-${e.status}">${STATUS_CN[e.status]||e.status}</span>
@@ -164,6 +189,7 @@ function renderEcos(w) {
         &nbsp;|&nbsp; 门禁: <b class="${g.green?'ok':'bad'}">${g.green?'必需检查全绿':'未全绿'}</b>
         &nbsp;|&nbsp; 双签: <b class="${g.dual_role_complete?'ok':'warn'}">${g.dual_role_complete?'完成':'待签'}</b></div>
       <div class="row">${sigs||'<span class="mut">（暂无有效签核）</span>'}</div>
+      ${voided.length?`<div class="row mut">已失效签核（保留审计）: ${voided.map(s=>`${ROLE_CN[s.role]||s.role}:${esc(s.user)}${s.delegator?`(代${esc(s.delegator)})`:""}·${esc(s.void_reason||"")}`).join("，")}</div>`:""}
       ${e.fingerprint?`<div class="row mut mono">基线指纹 ${e.fingerprint} · 约束v${e.constraints_version_at_freeze}</div>`:""}
       ${e.queue?.length?`<div class="row warn">排队中，等待模块: ${e.queue.map(q=>q.module).join(", ")}</div>`:""}
       ${e.blocks?.length?`<div class="row mut">后续排队 ECO: ${e.blocks.map(q=>q.eco_id).join(", ")}</div>`:""}
@@ -209,6 +235,53 @@ async function downloadZip() {
   a.href = URL.createObjectURL(blob); a.download = "baseline-diff.zip"; a.click();
 }
 
+// ---- 临时代理签核 ----
+async function createDelegation() {
+  const from = $("dg-from").value, to = $("dg-to").value;
+  if (!from || !to) { toast("请填写生效/失效时间", "err"); return; }
+  try {
+    const d = await api("/api/delegations", "POST", {
+      role: $("dg-role").value,
+      delegator: $("dg-delegator").value.trim(),
+      delegate: $("dg-delegate").value.trim(),
+      effective_from: new Date(from).toISOString(),
+      effective_to: new Date(to).toISOString(),
+      by: $("dg-by").value.trim() || "admin"});
+    toast(d.deduplicated
+      ? `相同配置已存在（#${d.id}），幂等返回，未生成重复记录`
+      : `已配置代理 #${d.id}：${esc(d.delegate)} 代 ${esc(d.delegator)}（${ROLE_CN[d.role]}）`, "ok");
+    await refresh();
+  } catch(e) { toast("⛔ " + e.message, "err"); }
+}
+
+async function revokeDelegation(id) {
+  await act(`/api/delegations/${id}/revoke`,
+            {by: $("dg-by").value.trim() || "admin"}, `代理 #${id} 已撤销，即刻不可再签`);
+}
+
+const fmtT = t => (t||"").slice(0,16).replace("T"," ");
+
+function renderDelegations(w) {
+  // 当前可签人员：角色负责人本人 + 生效中代理（含代理来源与有效期）
+  $("signers").innerHTML = Object.values(w.current_signers||{}).map(r => {
+    const ds = r.delegates.map(d =>
+      `<span class="chip">${esc(d.delegate)} ⇐ ${esc(d.delegator)}（至 ${fmtT(d.effective_to)} UTC）</span>`).join(" ");
+    return `<div class="row"><b>${ROLE_CN[r.role]||r.role}</b>
+      <span class="mut">当前可签：角色负责人本人${r.delegates.length?"，及代理：":"（暂无生效中代理）"}</span>${ds}</div>`;
+  }).join("");
+  $("delegations").innerHTML = (w.delegations||[]).length
+    ? `<table><tr><th>#</th><th>角色</th><th>代理链（代理人⇐被代理人）</th><th>有效期(UTC)</th><th>状态</th><th></th></tr>` +
+      w.delegations.map(d => `<tr>
+        <td>${d.id}</td><td>${ROLE_CN[d.role]||d.role}</td>
+        <td class="mono">${esc(d.delegate)} ⇐ ${esc(d.delegator)}</td>
+        <td class="mut mono">${fmtT(d.effective_from)} → ${fmtT(d.effective_to)}</td>
+        <td><span class="tag dg-${d.status}">${DG_STATUS[d.status]||d.status}</span></td>
+        <td>${["ACTIVE","PENDING"].includes(d.status)
+             ? `<button class="danger" onclick="revokeDelegation(${d.id})">撤销</button>` : ""}</td>
+      </tr>`).join("") + "</table>"
+    : '<div class="mut">（暂无代理配置）</div>';
+}
+
 function renderMisc(w) {
   $("locks").innerHTML = w.locks.length
     ? w.locks.map(l=>`<span class="chip">${l.module}→${l.eco_id}</span>`).join(" ")
@@ -219,5 +292,11 @@ function renderMisc(w) {
         <td class="bad">${r.reason}</td><td class="mut">${(r.received_at||"").slice(11)}</td></tr>`).join("")+"</table>"
     : '<div class="mut">（暂无拒收记录）</div>';
 }
+
+// 默认代理窗口：现在 → 7 天后
+const isoLocal = d => { const p = n => String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+$("dg-from").value = isoLocal(new Date());
+$("dg-to").value = isoLocal(new Date(Date.now() + 7*864e5));
 
 refresh().catch(e=>toast(e.message,"err"));
