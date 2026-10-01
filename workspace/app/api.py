@@ -110,6 +110,13 @@ def _make_handler(svc: ECOService):
                     return self._send(200, svc.current_constraints())
                 if path == "/api/rejected-results":
                     return self._send(200, {"rejected": svc.rejected_results()})
+                if path == "/api/admin/delegations":
+                    return self._send(200, {"delegations": svc.list_delegations()})
+                m = re.fullmatch(r"/api/admin/delegations/(\d+)", path)
+                if m:
+                    return self._send(200, svc.get_delegation(int(m.group(1))))
+                if path == "/api/current-signers":
+                    return self._send(200, svc.current_signers())
                 self._send(404, {"error": "NOT_FOUND", "message": path})
             except ECOError as e:
                 self._err(e)
@@ -148,7 +155,19 @@ def _make_handler(svc: ECOService):
                 m = re.fullmatch(r"/api/ecos/([^/]+)/signoff", path)
                 if m:
                     return self._send(200, svc.signoff(
-                        m.group(1), b["role"], b.get("user", b.get("by", "?"))))
+                        m.group(1), b["role"], b.get("user", b.get("by", "?")),
+                        b.get("delegation_id")))
+                # 临时代理签核：管理员配置 / 撤销
+                if path == "/api/admin/delegations":
+                    d = svc.create_delegation(
+                        b["role"], b["delegate_user"], b["valid_from"], b["valid_until"],
+                        b.get("granted_by", b.get("by", "admin")),
+                        b.get("principal_user"), b.get("note", ""))
+                    return self._send(201 if not d.get("deduped") else 200, d)
+                m = re.fullmatch(r"/api/admin/delegations/(\d+)/revoke", path)
+                if m:
+                    return self._send(200, svc.revoke_delegation(
+                        int(m.group(1)), b.get("revoked_by", b.get("by", "admin"))))
                 # 更具体的路径必须排在同前缀通用模式之前（fullmatch 已锚定，
                 # 但 merge-into 有两段，需先于通用段；resume 亦先于裸 release 防御）
                 m = re.fullmatch(r"/api/ecos/([^/]+)/release/resume", path)

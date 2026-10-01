@@ -64,7 +64,32 @@
 <div class="wrap">
 <div>
   <div class="panel">
-    <h2>① 提交 ECO（冻结网表 / 约束 / 模块 / 验证矩阵）</h2>
+    <h2>① 管理员配置临时代理签核</h2>
+    <div class="row mut">为两种签核角色指定临时可签自然人、生效/失效时间，可随时撤销。
+      服务端在<b>签核动作发生时</b>校验：未生效 / 已过期 / 已撤销一律拒绝。</div>
+    <div id="signers" class="row"></div>
+    <div class="grid2">
+      <select id="dlg-role">
+        <option value="TIMING_LEAD">时序负责人 TIMING_LEAD</option>
+        <option value="METHODOLOGY_LEAD">方法学负责人 METHODOLOGY_LEAD</option>
+      </select>
+      <input id="dlg-user" placeholder="代理人账号，如 backup.wang"/>
+    </div>
+    <div class="grid2">
+      <input id="dlg-principal" placeholder="被代理的负责人（可选，用于来源展示）"/>
+      <input id="dlg-admin" placeholder="配置管理员" value="admin.chen"/>
+    </div>
+    <div class="grid2">
+      <label class="mut">生效 <input id="dlg-from" type="datetime-local" style="width:100%"/></label>
+      <label class="mut">失效 <input id="dlg-until" type="datetime-local" style="width:100%"/></label>
+    </div>
+    <div class="row"><input id="dlg-note" style="flex:1" placeholder="备注（可选），如 负责人休假代理"/>
+      <button onclick="createDelegation()">配置代理</button></div>
+    <div id="delegations"></div>
+  </div>
+
+  <div class="panel">
+    <h2>② 提交 ECO（冻结网表 / 约束 / 模块 / 验证矩阵）</h2>
     <div class="grid2">
       <input id="f-title" placeholder="ECO 标题，如 ALU 时序修复"/>
       <input id="f-owner" placeholder="负责人" value="wei.dong"/>
@@ -80,14 +105,14 @@
   </div>
 
   <div class="panel">
-    <h2>② ECO 队列与签核</h2>
+    <h2>③ ECO 队列与签核</h2>
     <div id="ecos"></div>
   </div>
 </div>
 
 <div>
   <div class="panel">
-    <h2>③ 发布基线（不可变）与差异包</h2>
+    <h2>④ 发布基线（不可变）与差异包</h2>
     <div id="baselines"></div>
     <div class="row">
       <select id="d-from" style="flex:1"></select><span>→</span><select id="d-to" style="flex:1"></select>
@@ -100,7 +125,7 @@
   </div>
 
   <div class="panel">
-    <h2>④ 运营态势：锁 / 拒收留痕 / 审计</h2>
+    <h2>⑤ 运营态势：锁 / 拒收留痕 / 审计</h2>
     <div class="row"><b>模块锁：</b><span id="locks" class="mono"></span></div>
     <div class="row mut">迟到、串基线、被作废的结果一律拒收，绝不拼接复用：</div>
     <div id="rejects"></div>

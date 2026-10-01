@@ -7,8 +7,11 @@
   B. 验证结果迟到 / 基础约束更新途中到来：拒收，ECO 须 rebase 重跑
   C. 两个 ECO 修改重叠模块：排队 + 合并裁决，旧结果作废
   D. 发布中断：RELEASING 持久化，resume 原子恢复；中断期间禁止任何变更
+  E. 临时代理签核：配置/撤销，动作时授权校验拒绝未生效/过期/撤销，同一人禁双签
 """
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 from .runner import gate_status, run_all_pending, submit
 from .service import ECOError, ECOService, ROLE_METHOD, ROLE_TIMING
@@ -36,7 +39,6 @@ def expect_reject(fn, label):
 
 def main():
     svc = ECOService(Store(":memory:"))
-
     # ---------------- A. 正常流 ----------------
     hr("A. 正常流：时序修复 ECO 冻结 → 依赖图检查 → 双签核 → 发布 R1")
     e1 = svc.create_eco(
@@ -157,6 +159,59 @@ def main():
     pkg = svc.diff_package("B-R0", resumed["new_baseline_id"])
     print(f"   5) 差异包 {pkg['from']['id']}→{pkg['to']['id']}: 模块变更 "
           f"{pkg['summary']['modules_changed']}，双角色={pkg['verification']['dual_role_distinct_users']}")
+
+    # ---------------- E. 临时代理签核 ----------------
+    hr("E. 临时代理签核：动作时授权校验 + 同一自然人禁双签 + 重新冻结失效")
+    now = datetime.now(timezone.utc)
+    iso = lambda dt: dt.isoformat(timespec="seconds")
+    e5 = svc.create_eco("L2C 功耗保持修复", "dev.e", ["l2c"],
+                        {"l2c": {"netlist": "MODULE l2c; CELL RETENTION u_r; ENDMODULE"}})
+    svc.freeze_eco(e5["id"], "dev.e"); run_all_pending(svc, e5["id"])
+    print(f"   1) {e5['id']} 全绿待签；timing.zhang 休假，管理员配置 backup.wang 代理时序")
+    dt = svc.create_delegation(
+        ROLE_TIMING, "backup.wang", iso(now - timedelta(hours=1)), iso(now + timedelta(days=1)),
+        "admin.chen", principal_user="timing.zhang", note="休假代理")
+    dt2 = svc.create_delegation(
+        ROLE_TIMING, "backup.wang", iso(now - timedelta(hours=1)), iso(now + timedelta(days=1)),
+        "admin.chen", principal_user="timing.zhang", note="休假代理")
+    print(f"      重复提交幂等: 同一 id={dt['id']}, deduped={dt2['deduped']}")
+    svc.signoff(e5["id"], ROLE_TIMING, "backup.wang", delegation_id=dt["id"])
+    print("   2) backup.wang 凭有效代理完成时序签（记录固化代理链）")
+    # 未生效 / 已过期 / 已撤销 三类拒绝
+    future = svc.create_delegation(
+        ROLE_METHOD, "future.sun", iso(now + timedelta(days=1)), iso(now + timedelta(days=2)),
+        "admin.chen")
+    expect_reject(lambda: svc.signoff(e5["id"], ROLE_METHOD, "future.sun",
+                                      delegation_id=future["id"]), "未生效代理签核")
+    past = svc.create_delegation(
+        ROLE_METHOD, "old.tan", iso(now - timedelta(days=2)), iso(now - timedelta(days=1)),
+        "admin.chen")
+    expect_reject(lambda: svc.signoff(e5["id"], ROLE_METHOD, "old.tan",
+                                      delegation_id=past["id"]), "已过期代理签核")
+    dm = svc.create_delegation(
+        ROLE_METHOD, "proxy.qian", iso(now - timedelta(hours=1)), iso(now + timedelta(days=1)),
+        "admin.chen")
+    print("   3) backup.wang 又持有方法学代理 → 同一自然人双签仍被拒")
+    both = svc.create_delegation(
+        ROLE_METHOD, "backup.wang", iso(now - timedelta(hours=1)), iso(now + timedelta(days=1)),
+        "admin.chen")
+    expect_reject(lambda: svc.signoff(e5["id"], ROLE_METHOD, "backup.wang",
+                                      delegation_id=both["id"]), "同一人经两条代理链双签")
+    svc.revoke_delegation(dm["id"], "admin.chen")
+    expect_reject(lambda: svc.signoff(e5["id"], ROLE_METHOD, "proxy.qian",
+                                      delegation_id=dm["id"]), "撤销后代理签核")
+    print("   4) 另一有效代理人 method.proxy 完成方法学签 → 发布；签核记录保留代理链")
+    dm2 = svc.create_delegation(
+        ROLE_METHOD, "method.proxy", iso(now - timedelta(hours=1)), iso(now + timedelta(days=7)),
+        "admin.chen", principal_user="method.li")
+    svc.signoff(e5["id"], ROLE_METHOD, "method.proxy", delegation_id=dm2["id"])
+    rel5 = svc.release_start(e5["id"], "dev.e")
+    print(f"      发布 {rel5['new_baseline_id']}；差异包签核:")
+    pkg = svc.diff_package("B-R0", rel5["new_baseline_id"])
+    for s in pkg["verification"]["signoffs"]:
+        chain = s["auth_chain"]
+        extra = f" 代 {chain['principal_user']}" if chain["kind"] == "DELEGATE" else "（本人）"
+        print(f"        {s['role']}: {s['user']} [{s['signoff_kind']}]{extra}")
 
     hr("全部场景完成。拒收留痕(最近 5 条):")
     for r in svc.rejected_results()[:5]:

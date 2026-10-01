@@ -77,12 +77,38 @@ CREATE TABLE IF NOT EXISTS signoff (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     eco_id          TEXT NOT NULL,
     role            TEXT NOT NULL,
-    user            TEXT NOT NULL,
+    user            TEXT NOT NULL,             -- 实际签字的自然人（代理人签则为代理人本人）
     epoch           INTEGER NOT NULL,
     overall_fp      TEXT NOT NULL,
     at              TEXT NOT NULL,
+    signoff_kind    TEXT NOT NULL DEFAULT 'DIRECT',  -- DIRECT / DELEGATE
+    delegation_id   INTEGER,                   -- DELEGATE 时指向 signoff_delegation.id
+    auth_chain_json TEXT NOT NULL DEFAULT '{}', -- 签核动作发生时的身份/代理链快照
+    voided_at       TEXT,                      -- 纪元/基线变化失效时刻（记录保留供审计）
+    voided_reason   TEXT,
     UNIQUE(eco_id, role, epoch)
 );
+
+-- 临时代理签核授权：管理员为两种签核角色指定临时自然人及其有效时间窗
+CREATE TABLE IF NOT EXISTS signoff_delegation (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    role            TEXT NOT NULL,            -- TIMING_LEAD / METHODOLOGY_LEAD
+    delegate_user   TEXT NOT NULL,            -- 被授权临时代理签核的自然人
+    principal_user  TEXT,                     -- 被代理的角色负责人（可空，仅用于展示来源）
+    granted_by      TEXT NOT NULL,            -- 配置该代理的管理员
+    granted_at      TEXT NOT NULL,
+    valid_from      TEXT NOT NULL,            -- 生效时间（UTC ISO-8601）
+    valid_until     TEXT NOT NULL,            -- 失效时间（UTC ISO-8601，半开区间）
+    status          TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / REVOKED
+    revoked_at      TEXT,
+    revoked_by      TEXT,
+    note            TEXT
+);
+-- 同一代理配置（角色+代理人+完全相同的时间窗）至多存在一条有效记录：
+-- 重复提交不得生成重复有效记录（应用层幂等返回既有记录，索引做最终防线）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_delegation_active_once
+ON signoff_delegation(role, delegate_user, valid_from, valid_until)
+WHERE status='ACTIVE';
 
 CREATE TABLE IF NOT EXISTS module_lock (
     module          TEXT PRIMARY KEY,
@@ -220,8 +246,24 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.lock = threading.RLock()
         self.conn.executescript(SCHEMA)
+        self._migrate()
         if seed:
             self._seed()
+
+    def _migrate(self):
+        """对既有落盘库补齐代理签核新增列（CREATE TABLE IF NOT EXISTS 不会改老表）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(signoff)")}
+        with self.tx() as c:
+            if "signoff_kind" not in cols:
+                c.execute("ALTER TABLE signoff ADD COLUMN signoff_kind TEXT NOT NULL DEFAULT 'DIRECT'")
+            if "delegation_id" not in cols:
+                c.execute("ALTER TABLE signoff ADD COLUMN delegation_id INTEGER")
+            if "auth_chain_json" not in cols:
+                c.execute("ALTER TABLE signoff ADD COLUMN auth_chain_json TEXT NOT NULL DEFAULT '{}'")
+            if "voided_at" not in cols:
+                c.execute("ALTER TABLE signoff ADD COLUMN voided_at TEXT")
+            if "voided_reason" not in cols:
+                c.execute("ALTER TABLE signoff ADD COLUMN voided_reason TEXT")
 
     # ---- 事务辅助 ----
     class _Tx:
@@ -276,7 +318,7 @@ class Store:
     def reset(self):
         with self.tx() as c:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
-                      "adjudication", "queue_entry", "module_lock", "signoff",
-                      "check_run", "eco", "constraint_event", "trunk", "baseline"]:
+                      "adjudication", "queue_entry", "module_lock", "signoff_delegation",
+                      "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline"]:
                 c.execute(f"DELETE FROM {t}")
         self._seed()

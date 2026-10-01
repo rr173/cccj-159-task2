@@ -148,6 +148,84 @@ class ApiTest(unittest.TestCase):
         s, err = self.call("/api/nope")
         self.assertEqual(s, 404)
 
+    def test_delegated_signoff_via_http(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        vf = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+        vu = (now + timedelta(days=1)).isoformat(timespec="seconds")
+
+        s, d = self.call("/api/ecos", "POST", {
+            "title": "代理签核流", "owner": "net.eng", "affected_modules": ["core"],
+            "edits": {"core": {"netlist": "MODULE core; CELL DELEG_HTTP; ENDMODULE"}}})
+        self.assertEqual(s, 201)
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "net.eng"})
+        for _ in range(20):
+            s, d = self.call(f"/api/ecos/{eid}")
+            pending = [c["type"] for c in d["gate"]["checks"] if c["status"] == "PENDING"]
+            if not pending:
+                break
+            for t in pending:
+                s, pkt = self.call(f"/api/ecos/{eid}/checks/{t}/inputs")
+                fp = compute_input_fingerprint(t, pkt["inputs"])
+                s, resp = self.call(f"/api/ecos/{eid}/checks/{t}/results", "POST",
+                                    {"run_id": pkt["run_id"], "fingerprint": fp,
+                                     "verdict": "PASS", "runner_id": "ci-runner"})
+                self.assertEqual(s, 200, resp)
+
+        # 配置两条代理（不同自然人），重复提交第一次配置应幂等不重复
+        body = {"role": "TIMING_LEAD", "delegate_user": "backup.wang",
+                "principal_user": "timing.zhang", "granted_by": "admin.chen",
+                "valid_from": vf, "valid_until": vu}
+        s, d1 = self.call("/api/admin/delegations", "POST", body)
+        self.assertEqual(s, 201)
+        s, d1b = self.call("/api/admin/delegations", "POST", body)
+        self.assertEqual(s, 200)
+        self.assertTrue(d1b["deduped"])
+        self.assertEqual(d1["id"], d1b["id"])
+
+        s, d2 = self.call("/api/admin/delegations", "POST",
+                          {"role": "METHODOLOGY_LEAD", "delegate_user": "proxy.qian",
+                           "granted_by": "admin.chen", "valid_from": vf, "valid_until": vu})
+        self.assertEqual(s, 201)
+
+        s, cs = self.call("/api/current-signers")
+        self.assertEqual(s, 200)
+        self.assertIn("backup.wang", cs["roles"]["TIMING_LEAD"]["delegate_users"])
+
+        # 代理人用 delegation_id 签核
+        s, sd = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                          {"role": "TIMING_LEAD", "user": "backup.wang",
+                           "delegation_id": d1["id"]})
+        self.assertEqual(s, 200, sd)
+        sig = next(x for x in sd["gate"]["valid_signoffs"] if x["role"] == "TIMING_LEAD")
+        self.assertEqual(sig["signoff_kind"], "DELEGATE")
+        self.assertEqual(sig["auth_chain"]["principal_user"], "timing.zhang")
+
+        # 撤销方法学代理后，代理人签核 403，ECO 仍 FROZEN
+        s, _ = self.call(f"/api/admin/delegations/{d2['id']}/revoke", "POST",
+                         {"by": "admin.chen"})
+        self.assertEqual(s, 200)
+        s, err = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                           {"role": "METHODOLOGY_LEAD", "user": "proxy.qian",
+                            "delegation_id": d2["id"]})
+        self.assertEqual(s, 403)
+        self.assertEqual(err["error"], "DELEGATION_REVOKED")
+        s, ed = self.call(f"/api/ecos/{eid}")
+        self.assertEqual(ed["status"], "FROZEN")
+
+        # 未生效代理 → 403
+        s, d3 = self.call("/api/admin/delegations", "POST",
+                          {"role": "METHODOLOGY_LEAD", "delegate_user": "future.sun",
+                           "granted_by": "admin",
+                           "valid_from": (now + timedelta(days=2)).isoformat(timespec="seconds"),
+                           "valid_until": (now + timedelta(days=3)).isoformat(timespec="seconds")})
+        s, err = self.call(f"/api/ecos/{eid}/signoff", "POST",
+                           {"role": "METHODOLOGY_LEAD", "user": "future.sun",
+                            "delegation_id": d3["id"]})
+        self.assertEqual(s, 403)
+        self.assertEqual(err["error"], "DELEGATION_NOT_STARTED")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
